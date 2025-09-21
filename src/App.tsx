@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PixelGrid } from './components/PixelGrid.tsx';
-import { Toolbar } from './components/Toolbar.tsx';
 
 import './app.css';
 import {
@@ -12,8 +11,7 @@ import {
   WalletModalProvider,
   WalletMultiButton,
 } from "@solana/wallet-adapter-react-ui";
-import { WalletAdapterNetwork } from "@solana/wallet-adapter-base";
-import { clusterApiUrl, Connection, PublicKey } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
 import {
   PhantomWalletAdapter,
   SolflareWalletAdapter,
@@ -134,102 +132,236 @@ export const AppContent: React.FC = () => {
     link.click();
   }, [data]);
 
-  // Mint NFT handler
+  // Mint NFT handler (robust pipeline: draw -> image upload -> metadata upload -> availability check -> mint)
   const handleMintNFT = async () => {
+    const PHASE_PREFIX = '[mint]';
+    const log = (...args: any[]) => console.info(PHASE_PREFIX, ...args);
+    const warn = (...args: any[]) => console.warn(PHASE_PREFIX, ...args);
+    const fail = (msg: string) => { throw new Error(msg); };
     try {
-      if (!walletCtx.connected || !walletCtx.publicKey) throw new Error('Wallet not connected');
-      // 1. Convert pixel grid to PNG
+      log('start');
+      if (!walletCtx.connected || !walletCtx.publicKey) fail('Wallet not connected');
+
+      // 1. Draw current pixel data to an offscreen canvas with better quality
+      log('phase=draw-canvas');
       const SCALE = 20;
       const canvas = document.createElement('canvas');
       canvas.width = WIDTH * SCALE;
       canvas.height = HEIGHT * SCALE;
       const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('No canvas context');
+      if (!ctx) fail('No canvas context');
+      
+      // Ensure crisp pixel art rendering
+      ctx!.imageSmoothingEnabled = false;
+      (ctx as any).webkitImageSmoothingEnabled = false;
+      
+      // Fill background with white to ensure visibility
+      ctx!.fillStyle = '#FFFFFF';
+      ctx!.fillRect(0, 0, canvas.width, canvas.height);
+      
+      // Draw pixels
       for (let y = 0; y < HEIGHT; y++) {
         for (let x = 0; x < WIDTH; x++) {
           const i = y * WIDTH + x;
-          ctx.fillStyle = data.pixels[i];
-          ctx.fillRect(x * SCALE, y * SCALE, SCALE, SCALE);
+          const color = data.pixels[i];
+          // Skip transparent/empty pixels, keep white background
+          if (color && color !== 'transparent' && color !== 'rgba(0,0,0,0)') {
+            ctx!.fillStyle = color;
+            ctx!.fillRect(x * SCALE, y * SCALE, SCALE, SCALE);
+          }
         }
       }
-      const dataUrl = canvas.toDataURL('image/png');
+      
+      // Generate high-quality PNG
+      const dataUrl = canvas.toDataURL('image/png', 1.0);
+      log('phase=draw-canvas complete, dataUrl length=%d', dataUrl.length);
 
-      // 2. Generate random 5-letter name
-      const randomName = Array.from({length: 5}, () => String.fromCharCode(97 + Math.floor(Math.random() * 26))).join('').toUpperCase();
+      // 2. Random name
+      const randomName = Array.from({ length: 5 }, () => String.fromCharCode(65 + Math.floor(Math.random() * 26))).join('');
+      log('phase=prepare name=%s', randomName);
 
-      // 3. Upload PNG to Arweave/IPFS via Metaplex
-      const { Metaplex, walletAdapterIdentity, irysStorage } = await import('@metaplex-foundation/js');
+      // 3. Setup Metaplex
+      log('phase=setup-metaplex');
+      const { Metaplex, walletAdapterIdentity, irysStorage, toMetaplexFile } = await import('@metaplex-foundation/js');
       const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=92f5ec77-69d5-4c15-b27f-f70fce0cc595');
       const metaplex = Metaplex.make(connection)
         .use(walletAdapterIdentity(walletCtx))
         .use(irysStorage());
 
-  
-      const { uri: imageUri } = await metaplex.nfts().uploadMetadata({
-        name: randomName,
-        image: dataUrl,
-        description: 'Pixel art NFT from Pixel Canvas',
-        seller_fee_basis_points: 0,
-      });
-
-      // Check if Arweave URL is accessible before minting
-      //TODO
-      const checkUrl = async (url: string) => {
-        try {
-          const res = await fetch(url, { method: 'HEAD' });
-          return res.ok;
-        } catch {
-          return false;
+      // 4. Convert data URL -> Metaplex file & upload (image first)
+      log('phase=upload-image start');
+      const dataUrlToBytes = (url: string) => {
+        const [meta, b64] = url.split(',');
+        if (!b64) throw new Error('Invalid data URL');
+        const mimeMatch = /data:(.*);base64/.exec(meta);
+        const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+        
+        // Validate it's a PNG
+        if (mime !== 'image/png') {
+          throw new Error(`Expected PNG format, got: ${mime}`);
         }
+        
+        const binary = atob(b64);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        
+        // Validate PNG magic bytes
+        if (bytes.length < 8 || bytes[0] !== 0x89 || bytes[1] !== 0x50 || bytes[2] !== 0x4E || bytes[3] !== 0x47) {
+          throw new Error('Invalid PNG format - missing PNG signature');
+        }
+        
+        log('PNG validation passed, size=%d bytes', bytes.length);
+        return { bytes, mime };
       };
-      const isAccessible = await checkUrl(imageUri);
-      if (!isAccessible) {
-        throw new Error('Metadata upload failed or not yet available on Arweave. Please retry in a few moments.');
+      
+      const { bytes, mime } = dataUrlToBytes(dataUrl);
+      const imageFile = toMetaplexFile(bytes, `${randomName}.png`, { 
+        contentType: 'image/png',
+        displayName: `${randomName}.png`
+      });
+      
+      log('uploading image file: %s (%d bytes)', imageFile.displayName, bytes.length);
+      const imageUri = await metaplex.storage().upload(imageFile);
+      log('phase=upload-image success uri=%s', imageUri);
+      
+      // 4.5. Give Arweave time to propagate the image (avoid CORS issues with direct checks)
+      log('phase=image-propagation-delay start');
+      await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay
+      log('phase=image-propagation-delay complete');
+
+      // 5. Upload metadata referencing the image URI with retry logic
+      log('phase=upload-metadata start');
+      let metadataUri: string = '';
+      const maxMetadataRetries = 3;
+      
+      for (let attempt = 1; attempt <= maxMetadataRetries; attempt++) {
+        try {
+          log(`metadata upload attempt ${attempt}/${maxMetadataRetries}`);
+          
+          const metadataObject = {
+            name: randomName,
+            symbol: 'PXCAN',
+            description: 'Pixel art NFT from Pixel Canvas',
+            image: imageUri,
+            seller_fee_basis_points: 0,
+            attributes: [
+              { trait_type: 'Width', value: WIDTH.toString() },
+              { trait_type: 'Height', value: HEIGHT.toString() },
+            ],
+            properties: {
+              files: [
+                { uri: imageUri, type: mime }
+              ],
+              category: 'image'
+            }
+          };
+          
+          log('metadata object:', JSON.stringify(metadataObject, null, 2));
+          
+          const result = await metaplex.nfts().uploadMetadata(metadataObject);
+          metadataUri = result.uri;
+          log('phase=upload-metadata success uri=%s', metadataUri);
+          break;
+        } catch (e) {
+          warn(`metadata upload attempt ${attempt} failed:`, e);
+          if (attempt === maxMetadataRetries) {
+            throw new Error(`Metadata upload failed after ${maxMetadataRetries} attempts: ${(e as Error).message}`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000 * attempt)); // Increasing delay
+        }
       }
 
-      // Mint NFT
+      // 6. Give Arweave more time to propagate the metadata
+      log('phase=metadata-propagation-delay start');
+      await new Promise(resolve => setTimeout(resolve, 8000)); // 8 second delay for metadata
+      log('phase=metadata-propagation-delay complete');
+
+      // 7. Mint NFT using metadata URI (NOT image URI)
+      log('phase=mint start');
       const mintResult = await metaplex.nfts().create({
-        uri: imageUri,
+        uri: metadataUri,
         name: randomName,
         sellerFeeBasisPoints: 0,
         symbol: 'PXCAN',
-        creators: [{ address: walletCtx.publicKey, share: 100 }],
+  creators: [{ address: walletCtx.publicKey!, share: 100 }],
       });
+      log('phase=mint success mint=%s', mintResult.mintAddress.toBase58());
 
-      alert(`NFT minted! Name: ${randomName}`);
+      alert(`NFT minted! Name: ${randomName}\nMint: ${mintResult.mintAddress.toBase58()}\nImage: ${imageUri}\nMetadata: ${metadataUri}`);
     } catch (e) {
-      alert('Mint failed: ' + (e as Error).message);
+      warn('error', e);
+      const error = e as Error;
+      let errorMessage = 'Mint failed: ' + error.message;
+      
+      // Check for common Arweave/upload related errors
+      if (error.message.includes('upload') || error.message.includes('storage') || error.message.includes('Arweave')) {
+        errorMessage += '\n\nThis appears to be a storage/upload issue. Please check your internet connection and try again.';
+      } else if (error.message.includes('wallet') || error.message.includes('signature')) {
+        errorMessage += '\n\nThis appears to be a wallet issue. Please check your wallet connection and try again.';
+      }
+      
+      alert(errorMessage);
     }
   };
 
+
   return (
-    <div className="app" ref={containerRef}>
-      <h1>Pixel Canvas 32x32</h1>
-      <WalletMultiButton style={{ marginBottom: 16 }} />
-      <button style={{ marginBottom: 16 }} onClick={handleMintNFT}>
-        Mint NFT
-      </button>
-      <Toolbar
-        color={currentColor}
-        onColorChange={setCurrentColor}
-        onClear={handleClear}
-        onExport={exportPNG}
-      />
-      <PixelGrid
-        width={data.width}
-        height={data.height}
-        pixels={data.pixels}
-        currentColor={currentColor}
-        onPaint={handlePixelAction}
-        isMouseDown={isMouseDown}
-        setIsMouseDown={setIsMouseDown}
-      />
+    <div className="win95-window" ref={containerRef}>
+      <div className="win95-titlebar">
+        <span className="title">Pixel Canvas 32x32</span>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <WalletMultiButton
+            style={{
+              background: '#dcdfe3',
+              border: '2px solid #7b7b7b',
+              borderRightColor: '#fff',
+              borderBottomColor: '#fff',
+              padding: '4px 14px',
+              fontSize: 13,
+              fontFamily: 'inherit',
+              boxShadow: 'none',
+              height: 32,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              cursor: 'pointer'
+            }}
+          />
+        </div>
+      </div>
+      <div className="win95-toolbar">
+        <div className="win95-toolbar-group" style={{ flex: '1 1 auto' }}>
+          <button className="win95-btn" onClick={handleMintNFT}>Mint NFT</button>
+          <button className="win95-btn" onClick={handleClear}>Clear</button>
+          <button className="win95-btn" onClick={exportPNG}>Export PNG</button>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 12 }}>Color</span>
+            <input className="win95-color" type="color" value={currentColor} onChange={e => setCurrentColor(e.target.value)} />
+          </label>
+        </div>
+      </div>
+      <div className="canvas-wrapper">
+        <PixelGrid
+          width={data.width}
+          height={data.height}
+          pixels={data.pixels}
+          currentColor={currentColor}
+          onPaint={handlePixelAction}
+          isMouseDown={isMouseDown}
+          setIsMouseDown={setIsMouseDown}
+        />
+      </div>
+      <div className="status-bar">
+        <div>{data.width}x{data.height} pixels</div>
+        <div>Color: {currentColor.toUpperCase()}</div>
+      </div>
     </div>
   );
 };
 
 function App() {
-  const network = WalletAdapterNetwork.Mainnet;
+  // const network = WalletAdapterNetwork.Mainnet;
   const endpoint = useMemo(() => 'https://mainnet.helius-rpc.com/?api-key=92f5ec77-69d5-4c15-b27f-f70fce0cc595', []);
   const wallets = useMemo(
     () => [new PhantomWalletAdapter(), new SolflareWalletAdapter()],
