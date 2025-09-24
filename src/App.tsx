@@ -18,6 +18,7 @@ import {
 } from "@solana/wallet-adapter-wallets";
 import "./App.css";
 import "@solana/wallet-adapter-react-ui/styles.css";
+import { isNull } from 'util';
 
 export const APP_STORAGE_KEY = 'pixel-canvas-v1';
 
@@ -73,6 +74,10 @@ export const AppContent: React.FC = () => {
   const [data, setData] = useState<PixelCanvasData>(() => load());
   const [currentColor, setCurrentColor] = useState('#000000');
   const [isMouseDown, setIsMouseDown] = useState(false);
+  const [isMinting, setIsMinting] = useState(false);
+  const [mintStatus, setMintStatus] = useState<string>("");
+  const [successInfo, setSuccessInfo] = useState<null | { name: string; mint: string; image: string; metadata: string }>(null);
+  const [errorInfo, setErrorInfo] = useState<null | { message: string }>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -139,11 +144,14 @@ export const AppContent: React.FC = () => {
     const warn = (...args: any[]) => console.warn(PHASE_PREFIX, ...args);
     const fail = (msg: string) => { throw new Error(msg); };
     try {
+      setIsMinting(true);
+      setMintStatus('Starting mint...');
       log('start');
       if (!walletCtx.connected || !walletCtx.publicKey) fail('Wallet not connected');
 
       // 1. Draw current pixel data to an offscreen canvas with better quality
       log('phase=draw-canvas');
+      setMintStatus('Rendering your pixel art...');
       const SCALE = 20;
       const canvas = document.createElement('canvas');
       canvas.width = WIDTH * SCALE;
@@ -182,6 +190,7 @@ export const AppContent: React.FC = () => {
 
       // 3. Setup Metaplex
       log('phase=setup-metaplex');
+      setMintStatus('Connecting to network...');
       const { Metaplex, walletAdapterIdentity, irysStorage, toMetaplexFile } = await import('@metaplex-foundation/js');
       const connection = new Connection('https://mainnet.helius-rpc.com/?api-key=92f5ec77-69d5-4c15-b27f-f70fce0cc595');
       const metaplex = Metaplex.make(connection)
@@ -190,6 +199,7 @@ export const AppContent: React.FC = () => {
 
       // 4. Convert data URL -> Metaplex file & upload (image first)
       log('phase=upload-image start');
+      setMintStatus('Uploading image to Arweave...');
       const dataUrlToBytes = (url: string) => {
         const [meta, b64] = url.split(',');
         if (!b64) throw new Error('Invalid data URL');
@@ -227,17 +237,20 @@ export const AppContent: React.FC = () => {
       
       // 4.5. Give Arweave time to propagate the image (avoid CORS issues with direct checks)
       log('phase=image-propagation-delay start');
+      setMintStatus('Waiting for image propagation...');
       await new Promise(resolve => setTimeout(resolve, 3000)); // 3 second delay
       log('phase=image-propagation-delay complete');
 
       // 5. Upload metadata referencing the image URI with retry logic
       log('phase=upload-metadata start');
+      setMintStatus('Preparing metadata...');
       let metadataUri: string = '';
       const maxMetadataRetries = 3;
       
       for (let attempt = 1; attempt <= maxMetadataRetries; attempt++) {
         try {
           log(`metadata upload attempt ${attempt}/${maxMetadataRetries}`);
+          setMintStatus(`Uploading metadata (${attempt}/${maxMetadataRetries})...`);
           
           const metadataObject = {
             name: randomName,
@@ -245,15 +258,11 @@ export const AppContent: React.FC = () => {
             description: 'Pixel art NFT from Pixel Canvas',
             image: imageUri,
             seller_fee_basis_points: 0,
-            attributes: [
-              { trait_type: 'Width', value: WIDTH.toString() },
-              { trait_type: 'Height', value: HEIGHT.toString() },
-            ],
             properties: {
               files: [
                 { uri: imageUri, type: mime }
               ],
-              category: 'image'
+              category: null
             }
           };
           
@@ -274,21 +283,30 @@ export const AppContent: React.FC = () => {
 
       // 6. Give Arweave more time to propagate the metadata
       log('phase=metadata-propagation-delay start');
+      setMintStatus('Waiting for metadata propagation...');
       await new Promise(resolve => setTimeout(resolve, 8000)); // 8 second delay for metadata
       log('phase=metadata-propagation-delay complete');
 
       // 7. Mint NFT using metadata URI (NOT image URI)
       log('phase=mint start');
+      setMintStatus('Sending mint transaction... Approve in your wallet');
       const mintResult = await metaplex.nfts().create({
         uri: metadataUri,
         name: randomName,
         sellerFeeBasisPoints: 0,
         symbol: 'PXCAN',
-  creators: [{ address: walletCtx.publicKey!, share: 100 }],
+        creators: [{ address: walletCtx.publicKey!, share: 100 }],
+        isMutable: true,
+        tokenStandard: 4,
       });
       log('phase=mint success mint=%s', mintResult.mintAddress.toBase58());
-
-      alert(`NFT minted! Name: ${randomName}\nMint: ${mintResult.mintAddress.toBase58()}\nImage: ${imageUri}\nMetadata: ${metadataUri}`);
+      setMintStatus('Finalizing...');
+      setSuccessInfo({
+        name: randomName,
+        mint: mintResult.mintAddress.toBase58(),
+        image: imageUri,
+        metadata: metadataUri,
+      });
     } catch (e) {
       warn('error', e);
       const error = e as Error;
@@ -301,7 +319,11 @@ export const AppContent: React.FC = () => {
         errorMessage += '\n\nThis appears to be a wallet issue. Please check your wallet connection and try again.';
       }
       
-      alert(errorMessage);
+      setErrorInfo({ message: errorMessage });
+    }
+    finally {
+      setIsMinting(false);
+      setMintStatus('');
     }
   };
 
@@ -332,7 +354,9 @@ export const AppContent: React.FC = () => {
       </div>
       <div className="win95-toolbar">
         <div className="win95-toolbar-group" style={{ flex: '1 1 auto' }}>
-          <button className="win95-btn" onClick={handleMintNFT}>Mint NFT</button>
+          <button className="win95-btn" onClick={handleMintNFT} disabled={isMinting} aria-busy={isMinting}>
+            {isMinting ? 'Minting…' : 'Mint NFT'}
+          </button>
           <button className="win95-btn" onClick={handleClear}>Clear</button>
           <button className="win95-btn" onClick={exportPNG}>Export PNG</button>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
@@ -356,6 +380,48 @@ export const AppContent: React.FC = () => {
         <div>{data.width}x{data.height} pixels</div>
         <div>Color: {currentColor.toUpperCase()}</div>
       </div>
+      {isMinting && (
+        <div className="mint-overlay" role="alert" aria-live="assertive">
+          <div className="mint-card">
+            <div className="mint-title">Minting in progress</div>
+            <div className="mint-progress">
+              <div className="bar" />
+            </div>
+            <div className="mint-subtext">{mintStatus || 'Please wait…'}</div>
+          </div>
+        </div>
+      )}
+      {/* Success Modal */}
+      {successInfo && (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <div className="modal-title">NFT Minted Successfully</div>
+            <div className="modal-body">
+              <div><strong>Name:</strong> {successInfo.name}</div>
+              <div><strong>Mint:</strong> <a href={`https://solscan.io/address/${successInfo.mint}`} target="_blank" rel="noreferrer">{successInfo.mint}</a></div>
+              <div><strong>Image:</strong> <a href={successInfo.image} target="_blank" rel="noreferrer">Open image</a></div>
+              <div><strong>Metadata:</strong> <a href={successInfo.metadata} target="_blank" rel="noreferrer">Open metadata</a></div>
+            </div>
+            <div className="modal-actions">
+              <button className="win95-btn" onClick={() => setSuccessInfo(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Error Modal */}
+      {errorInfo && (
+        <div className="modal-overlay" role="dialog" aria-modal="true">
+          <div className="modal-card">
+            <div className="modal-title">Mint Failed</div>
+            <div className="modal-body">
+              <pre style={{ whiteSpace: 'pre-wrap', margin: 0 }}>{errorInfo.message}</pre>
+            </div>
+            <div className="modal-actions">
+              <button className="win95-btn" onClick={() => setErrorInfo(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
