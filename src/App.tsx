@@ -256,11 +256,11 @@ export const AppContent: React.FC = () => {
             name: randomName,
             symbol: 'PXCAN',
             description: 'Pixel art NFT from Pixel Canvas',
-            image: imageUri,
+            image: imageUri + '?ext=png',
             seller_fee_basis_points: 0,
             properties: {
               files: [
-                { uri: imageUri, type: mime }
+                { uri: imageUri + '?ext=png', type: mime }
               ],
               category: null
             }
